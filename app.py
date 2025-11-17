@@ -45,8 +45,9 @@ def extract_text_from_pdf(pdf_bytes):
         images = convert_from_bytes(pdf_bytes, dpi=300)
         full_text = ""
         for img in images:
-            text = pytesseract.image_to_string(img)
-            full_text += text + "\n\n"
+            # Use better OCR config for handwriting
+            text = pytesseract.image_to_string(img, config='--psm 6 --oem 3')
+            full_text += text + "\n\n=== PAGE BREAK ===\n\n"
         return full_text, images[0] if images else None
     except Exception as e:
         return None, None
@@ -59,17 +60,40 @@ def extract_name_reg_from_top(first_page_img):
     try:
         width, height = first_page_img.size
         top_portion = first_page_img.crop((0, 0, width, int(height * 0.25)))
-        text = pytesseract.image_to_string(top_portion)
+        text = pytesseract.image_to_string(top_portion, config='--psm 6')
         
-        # Extract name (look for "Name:" or similar)
-        name_match = re.search(r'[Nn]ame\s*:?\s*([A-Za-z\s]+)', text)
-        name = name_match.group(1).strip() if name_match else None
+        # Try multiple patterns for name
+        name = None
+        name_patterns = [
+            r'[Nn]ame\s*:?\s*([A-Za-z][A-Za-z\s\.]+?)(?:\n|[Rr]eg|$)',
+            r'Student\s*[Nn]ame\s*:?\s*([A-Za-z][A-Za-z\s\.]+?)(?:\n|[Rr]eg|$)',
+            r'^\s*([A-Z][a-z]+\s+[A-Z][a-z]+)',  # Capitalized words at start
+        ]
         
-        # Extract registration (look for numbers)
-        reg_match = re.search(r'[Rr]eg(?:istration)?\s*[Nn]o?\.?\s*:?\s*([0-9]+)', text)
-        if not reg_match:
-            reg_match = re.search(r'\b([0-9]{6,})\b', text)
-        reg = reg_match.group(1).strip() if reg_match else None
+        for pattern in name_patterns:
+            match = re.search(pattern, text, re.MULTILINE)
+            if match:
+                name = match.group(1).strip()
+                # Clean up common OCR errors
+                name = re.sub(r'[^A-Za-z\s\.]', '', name)
+                if len(name) > 3:
+                    break
+        
+        # Try multiple patterns for registration
+        reg = None
+        reg_patterns = [
+            r'[Rr]eg(?:istration)?\s*[Nn]o?\.?\s*:?\s*([0-9]+)',
+            r'[Rr]oll\s*[Nn]o?\.?\s*:?\s*([0-9]+)',
+            r'[Ii][Dd]\s*:?\s*([0-9]+)',
+            r'\b([0-9]{6,10})\b',  # Any 6-10 digit number
+        ]
+        
+        for pattern in reg_patterns:
+            match = re.search(pattern, text)
+            if match:
+                reg = match.group(1).strip()
+                if len(reg) >= 4:
+                    break
         
         # Determine status
         if name and reg:
@@ -86,9 +110,26 @@ def extract_name_reg_from_top(first_page_img):
 def find_answer_by_marker(full_text, marker_text, next_marker=None):
     """Extract answer text between marker and next marker"""
     try:
-        # Case-insensitive search
-        pattern = re.escape(marker_text)
-        match = re.search(pattern, full_text, re.IGNORECASE)
+        # Try multiple marker variations for better matching
+        marker_variations = [
+            marker_text,
+            marker_text.replace(' ', '\s+'),  # Allow multiple spaces
+            marker_text.replace(' ', '.*?'),    # Allow any chars between words
+        ]
+        
+        match = None
+        for marker_var in marker_variations:
+            pattern = re.escape(marker_var) if marker_var == marker_text else marker_var
+            match = re.search(pattern, full_text, re.IGNORECASE | re.DOTALL)
+            if match:
+                break
+        
+        if not match:
+            # Fallback: try finding key words from marker
+            key_words = marker_text.split()[:3]  # First 3 words
+            if len(key_words) >= 2:
+                fuzzy_pattern = '.*?'.join(re.escape(word) for word in key_words)
+                match = re.search(fuzzy_pattern, full_text, re.IGNORECASE | re.DOTALL)
         
         if not match:
             return None
@@ -97,14 +138,28 @@ def find_answer_by_marker(full_text, marker_text, next_marker=None):
         
         # Find end position
         if next_marker:
-            next_pattern = re.escape(next_marker)
-            next_match = re.search(next_pattern, full_text[start_pos:], re.IGNORECASE)
-            end_pos = start_pos + next_match.start() if next_match else len(full_text)
-        else:
+            next_variations = [
+                next_marker,
+                next_marker.split()[:3],  # First 3 words of next marker
+            ]
+            
             end_pos = len(full_text)
+            for next_var in next_variations:
+                if isinstance(next_var, list):
+                    next_pattern = '.*?'.join(re.escape(word) for word in next_var)
+                else:
+                    next_pattern = re.escape(next_var)
+                
+                next_match = re.search(next_pattern, full_text[start_pos:], re.IGNORECASE | re.DOTALL)
+                if next_match:
+                    end_pos = start_pos + next_match.start()
+                    break
+        else:
+            # For last question, take next 1000 chars max
+            end_pos = min(start_pos + 1000, len(full_text))
         
         answer = full_text[start_pos:end_pos].strip()
-        return answer if answer else None
+        return answer if answer and len(answer) > 5 else None
     except Exception as e:
         return None
 
